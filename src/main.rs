@@ -19,10 +19,18 @@ struct System {
     pub feed_rate: f32,
     pub kill_rate: f32,
     pub diffusion_rates: (f32, f32),
+
+    b_range: F32Range,
 }
 
 // chemical A, chemical B
 type Cell = (f32, f32);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct F32Range {
+    low: f32,
+    high: f32,
+}
 
 impl System {
     pub fn new(width: usize, height: usize) -> Self {
@@ -44,6 +52,12 @@ impl System {
             diffusion_rates: (1.0, 0.5),
             feed_rate: 0.055,
             kill_rate: 0.062,
+
+            b_range: if size > 0 {
+                F32Range::zero()
+            } else {
+                F32Range::empty()
+            },
         }
     }
 
@@ -55,8 +69,22 @@ impl System {
         self.height
     }
 
+    /// Warning: be sure to call `update_metadata` after a call to `set` as it's not done
+    /// automatically.
     pub fn set(&mut self, (x, y): (usize, usize), (a, b): Cell) {
         self.world[y * self.width + x] = (a, b);
+    }
+
+    /// Warning: slow operation, do it as few times as possible.
+    pub fn update_metadata(&mut self) {
+        self.b_range = F32Range::empty();
+        for c in &self.world {
+            self.b_range.expand(c.1);
+        }
+    }
+
+    pub fn b_range(&self) -> F32Range {
+        self.b_range
     }
 
     pub fn get(&self, (x, y): (usize, usize)) -> Cell {
@@ -72,11 +100,16 @@ impl System {
         })
     }
 
+    /// Evolves the current state of the system
+    ///
+    /// It also updated the metadata because it's quite cheap to do here.
     #[allow(clippy::many_single_char_names)]
     pub fn evolve(&mut self, dt: f32) {
         let (da, db) = self.diffusion_rates;
         let f = self.feed_rate;
         let k = self.kill_rate;
+
+        self.b_range = F32Range::empty();
 
         for (i, nc) in self.world_buffer.iter_mut().enumerate() {
             let (x, y) = (i % self.width, i / self.width);
@@ -105,6 +138,8 @@ impl System {
             let (a, b) = self.world[i];
             nc.0 = a + dt * (da * neighbors_a - a * b.powi(2) + f * (1.0 - a));
             nc.1 = b + dt * (db * neighbors_b + a * b.powi(2) - (k + f) * b);
+
+            self.b_range.expand(nc.1);
         }
 
         std::mem::swap(&mut self.world, &mut self.world_buffer);
@@ -112,7 +147,7 @@ impl System {
 }
 
 fn main() {
-    let (width, height) = (1024_u16, 1024_u16);
+    let (width, height) = (512_u16, 512_u16);
     let iterations = 3600;
     let framerate = 120;
     let img_dir = Path::new("img");
@@ -160,6 +195,8 @@ fn main() {
                 system.set((rx, ty + i), (1.0, 1.0));
             }
         }
+
+        system.update_metadata();
     }
 
     let stdout = std::io::stdout();
@@ -168,13 +205,18 @@ fn main() {
     let mut img = image::GrayImage::new(width.into(), height.into());
     let mut render = |system: &System, path: &OsStr| {
         for ((_, c), pix) in system.cells().zip(img.pixels_mut()) {
-            *pix = image::Luma([(c.1 * 255.0) as u8]);
+            let g = system.b_range().t(c.1) * 255.0;
+            *pix = image::Luma([g as u8]);
         }
 
         img.save(path).unwrap();
     };
 
-    for i in 0..iterations {
+    if video {
+        render(&system, img_dir.join("rd-0.png").as_os_str());
+    }
+
+    for i in 1..=iterations {
         write!(stdout, "\r iteration: {}", i).unwrap();
         stdout.flush().unwrap();
 
@@ -216,4 +258,29 @@ generation took {} min {} secs
         elapsed.as_secs() % 60
     )
     .unwrap();
+}
+
+impl F32Range {
+    pub const fn zero() -> Self {
+        Self {
+            low: 0.0,
+            high: 0.0,
+        }
+    }
+
+    pub const fn empty() -> Self {
+        Self {
+            low: std::f32::INFINITY,
+            high: std::f32::NEG_INFINITY,
+        }
+    }
+
+    pub fn expand(&mut self, v: f32) {
+        self.low = self.low.min(v);
+        self.high = self.high.max(v);
+    }
+
+    pub fn t(self, v: f32) -> f32 {
+        (v - self.low) / (self.high - self.low)
+    }
 }
