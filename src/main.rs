@@ -1,254 +1,78 @@
-use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
 use rand::prelude::*;
+use structopt::StructOpt;
 
-#[derive(Debug, Clone)]
-struct System {
-    width: usize,
-    height: usize,
+use rd::System;
 
-    world: Vec<Cell>,
-    world_buffer: Vec<Cell>,
-    kernel: [f32; 9],
+#[derive(Debug, StructOpt)]
+struct Opts {
+    #[structopt(short, long, default_value = "512")]
+    width: u16,
 
-    pub feed_rate: f32,
-    pub kill_rate: f32,
-    pub diffusion_rates: (f32, f32),
+    #[structopt(short, long, default_value = "512")]
+    height: u16,
 
-    b_range: F32Range,
+    #[structopt(short, long, default_value = "300")]
+    iterations: usize,
+
+    #[structopt(short, long, default_value = "1")]
+    speed: usize,
+
+    #[structopt(long)]
+    without_video: bool,
+
+    #[structopt(long, parse(from_os_str), default_value = "img")]
+    img_dir: PathBuf,
+
+    #[structopt(subcommand)]
+    mode: Option<Mode>,
 }
 
-// chemical A, chemical B
-type Cell = (f32, f32);
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct F32Range {
-    low: f32,
-    high: f32,
+#[derive(Debug, StructOpt)]
+enum Mode {
+    Rect,
+    Random,
 }
 
-impl System {
-    pub fn new(width: usize, height: usize) -> Self {
-        let size = width * height;
-
-        System {
-            width,
-            height,
-            world: vec![(1.0, 0.0); size],
-            world_buffer: vec![(1.0, 0.0); size],
-
-            #[rustfmt::skip]
-            kernel: [
-                0.05,  0.20, 0.05,
-                0.20, -1.00, 0.20,
-                0.05,  0.20, 0.05,
-            ],
-
-            diffusion_rates: (1.0, 0.5),
-            feed_rate: 0.055,
-            kill_rate: 0.062,
-
-            b_range: if size > 0 {
-                F32Range::zero()
-            } else {
-                F32Range::empty()
-            },
-        }
-    }
-
-    pub fn width(&self) -> usize {
-        self.width
-    }
-
-    pub fn height(&self) -> usize {
-        self.height
-    }
-
-    /// Warning: be sure to call `update_metadata` after a call to `set` as it's not done
-    /// automatically.
-    pub fn set(&mut self, (x, y): (usize, usize), (a, b): Cell) {
-        self.world[y * self.width + x] = (a, b);
-    }
-
-    /// Warning: slow operation, do it as few times as possible.
-    pub fn update_metadata(&mut self) {
-        self.b_range = F32Range::empty();
-        for c in &self.world {
-            self.b_range.expand(c.1);
-        }
-    }
-
-    pub fn b_range(&self) -> F32Range {
-        self.b_range
-    }
-
-    pub fn get(&self, (x, y): (usize, usize)) -> Cell {
-        self.world[y * self.width + x]
-    }
-
-    pub fn cells(&self) -> impl Iterator<Item = ((usize, usize), Cell)> + '_ {
-        self.world.iter().enumerate().map(move |(i, c)| {
-            let x = i % self.width;
-            let y = i / self.width;
-
-            ((x, y), *c)
-        })
-    }
-
-    /// Evolves the current state of the system
-    ///
-    /// It also updated the metadata because it's quite cheap to do here.
-    #[allow(clippy::many_single_char_names)]
-    pub fn evolve(&mut self, dt: f32) {
-        let (da, db) = self.diffusion_rates;
-        let f = self.feed_rate;
-        let k = self.kill_rate;
-
-        self.b_range = F32Range::empty();
-
-        for (i, nc) in self.world_buffer.iter_mut().enumerate() {
-            let (x, y) = (i % self.width, i / self.width);
-
-            let lx = if x == 0 { self.width - 1 } else { x - 1 };
-            let rx = (x + 1) % self.width;
-
-            let ty = if y == 0 { self.height - 1 } else { y - 1 };
-            let by = (y + 1) % self.height;
-
-            #[rustfmt::skip]
-            let neighbors = [
-                (lx, ty), (x, ty), (rx, ty),
-                (lx,  y), (x,  y), (rx,  y),
-                (lx, by), (x, by), (rx, by),
-            ];
-
-            let mut neighbors_a = 0.0;
-            let mut neighbors_b = 0.0;
-            for ((xx, yy), k) in neighbors.iter().zip(&self.kernel) {
-                let (a, b) = self.world[yy * self.width + xx];
-                neighbors_a += k * a;
-                neighbors_b += k * b;
-            }
-
-            let (a, b) = self.world[i];
-            nc.0 = a + dt * (da * neighbors_a - a * b.powi(2) + f * (1.0 - a));
-            nc.1 = b + dt * (db * neighbors_b + a * b.powi(2) - (k + f) * b);
-
-            self.b_range.expand(nc.1);
-        }
-
-        std::mem::swap(&mut self.world, &mut self.world_buffer);
-    }
+struct Renderer {
+    with_video: bool,
+    speed: usize,
+    img_dir: PathBuf,
+    tmp_img: image::GrayImage,
 }
 
 fn main() {
-    let (width, height) = (512_u16, 512_u16);
-    let iterations = 12000;
-    let speed = 20;
-    let img_dir = Path::new("img");
-    let video = true;
-    let random_starting_state = false;
+    let opts = Opts::from_args();
 
-    if !img_dir.exists() {
-        fs::create_dir(img_dir).unwrap();
-    }
-
-    for entry in img_dir.read_dir().unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_name().to_string_lossy().ends_with(".png") {
-            fs::remove_file(entry.path()).unwrap();
-        }
-    }
+    setup_img_dir(&opts);
 
     let start_ts = Instant::now();
-    let mut system = System::new(width.into(), height.into());
 
-    {
-        let width = system.width();
-        let height = system.height();
-
-        if random_starting_state {
-            let mut rng = thread_rng();
-            for x in 0..width {
-                for y in 0..height {
-                    if rng.gen::<f32>() < 0.05 {
-                        system.set((x, y), (1.0, 1.0));
-                    }
-                }
-            }
-        } else {
-            let l = width.min(height) / 4;
-            let ty = height / 2 - l / 2;
-            let sx = width / 2 - l / 2;
-            let by = ty + l;
-            let rx = sx + l;
-
-            for i in 0..l {
-                system.set((sx + i, ty), (1.0, 1.0));
-                system.set((sx + i, by), (1.0, 1.0));
-                system.set((sx, ty + i), (1.0, 1.0));
-                system.set((rx, ty + i), (1.0, 1.0));
-            }
-        }
-
-        system.update_metadata();
-    }
+    let mut system = create_system(&opts);
 
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
 
-    let mut img = image::GrayImage::new(width.into(), height.into());
-    let mut render = |system: &System, path: &OsStr| {
-        for ((_, c), pix) in system.cells().zip(img.pixels_mut()) {
-            let g = system.b_range().t(c.1) * 255.0;
-            *pix = image::Luma([g as u8]);
-        }
+    let mut renderer = Renderer::new(&opts);
+    renderer.start(&system);
 
-        img.save(path).unwrap();
-    };
-
-    if video {
-        render(&system, img_dir.join("rd-0.png").as_os_str());
-    }
-
-    for i in 1..=iterations {
-        write!(stdout, "\r iteration: {}", i).unwrap();
+    for i in 1..=opts.iterations {
+        write!(stdout, "\riteration: {}", i).unwrap();
         stdout.flush().unwrap();
 
         system.evolve(1.0);
 
-        if video && i % speed == 0 {
-            render(
-                &system,
-                img_dir.join(&format!("rd-{}.png", i / speed)).as_os_str(),
-            );
-        }
+        renderer.snapshot(&system, i);
     }
 
     let elapsed = start_ts.elapsed();
 
-    if video {
-        Command::new("ffmpeg")
-            .args(&[
-                "-framerate",
-                "60",
-                "-i",
-                img_dir.join("rd-%00d.png").to_str().unwrap(),
-                "-pix_fmt",
-                "yuv420p",
-                "-y",
-                "rd.mp4",
-            ])
-            .status()
-            .unwrap();
-    } else {
-        render(&system, OsStr::new("rd.png"));
-    }
+    renderer.end(&system);
 
     writeln!(
         stdout,
@@ -263,27 +87,114 @@ generation took {} min {} secs
     .unwrap();
 }
 
-impl F32Range {
-    pub const fn zero() -> Self {
-        Self {
-            low: 0.0,
-            high: 0.0,
+fn create_system(opts: &Opts) -> System {
+    let mut system = System::new(opts.width.into(), opts.height.into());
+
+    let width = system.width();
+    let height = system.height();
+
+    match opts.mode {
+        None | Some(Mode::Rect) => {
+            let l = width.min(height) / 4;
+            let ty = height / 2 - l / 2;
+            let sx = width / 2 - l / 2;
+            let by = ty + l;
+            let rx = sx + l;
+
+            for i in 0..l {
+                system.set((sx + i, ty), (1.0, 1.0));
+                system.set((sx + i, by), (1.0, 1.0));
+                system.set((sx, ty + i), (1.0, 1.0));
+                system.set((rx, ty + i), (1.0, 1.0));
+            }
+        }
+        Some(Mode::Random) => {
+            let mut rng = thread_rng();
+            for x in 0..width {
+                for y in 0..height {
+                    if rng.gen::<f32>() < 0.05 {
+                        system.set((x, y), (1.0, 1.0));
+                    }
+                }
+            }
         }
     }
 
-    pub const fn empty() -> Self {
+    system.update_metadata();
+
+    system
+}
+
+fn setup_img_dir(opts: &Opts) {
+    if !opts.img_dir.exists() {
+        fs::create_dir(&opts.img_dir).unwrap();
+    }
+
+    for entry in opts.img_dir.read_dir().unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name().to_string_lossy().ends_with(".png") {
+            fs::remove_file(entry.path()).unwrap();
+        }
+    }
+}
+
+impl Renderer {
+    fn new(opts: &Opts) -> Self {
         Self {
-            low: std::f32::INFINITY,
-            high: std::f32::NEG_INFINITY,
+            img_dir: opts.img_dir.clone(),
+            with_video: !opts.without_video,
+            speed: opts.speed,
+
+            tmp_img: image::GrayImage::new(opts.width.into(), opts.height.into()),
         }
     }
 
-    pub fn expand(&mut self, v: f32) {
-        self.low = self.low.min(v);
-        self.high = self.high.max(v);
+    fn start(&mut self, system: &System) {
+        if self.with_video {
+            let path = self.img_dir.join("rd-0.png");
+            self.render_frame(system, &path);
+        }
     }
 
-    pub fn t(self, v: f32) -> f32 {
-        (v - self.low) / (self.high - self.low)
+    fn snapshot(&mut self, system: &System, gen: usize) {
+        assert!(gen > 0);
+
+        if self.with_video && gen % self.speed == 0 {
+            let path = self.img_dir.join(&format!("rd-{}.png", gen / self.speed));
+            self.render_frame(&system, &path);
+        }
+    }
+
+    fn end(&mut self, system: &System) {
+        self.render_frame(&system, Path::new("rd.png"));
+
+        if self.with_video {
+            self.build_video();
+        }
+    }
+
+    fn render_frame(&mut self, system: &System, path: &Path) {
+        for ((_, c), pix) in system.cells().zip(self.tmp_img.pixels_mut()) {
+            let g = system.b_range().t(c.1) * 255.0;
+            *pix = image::Luma([g as u8]);
+        }
+
+        self.tmp_img.save(path).unwrap();
+    }
+
+    fn build_video(&self) {
+        Command::new("ffmpeg")
+            .args(&[
+                "-framerate",
+                "60",
+                "-i",
+                self.img_dir.join("rd-%00d.png").to_str().unwrap(),
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+                "rd.mp4",
+            ])
+            .status()
+            .unwrap();
     }
 }
