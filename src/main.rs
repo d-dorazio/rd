@@ -1,3 +1,4 @@
+use std::convert::TryFrom;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -37,6 +38,10 @@ struct Opts {
 enum Mode {
     Rect,
     Random,
+    Image {
+        #[structopt(parse(from_os_str))]
+        input: PathBuf,
+    },
 }
 
 struct Renderer {
@@ -93,7 +98,7 @@ fn create_system(opts: &Opts) -> System {
     let width = system.width();
     let height = system.height();
 
-    match opts.mode {
+    match &opts.mode {
         None | Some(Mode::Rect) => {
             let l = width.min(height) / 4;
             let ty = height / 2 - l / 2;
@@ -115,6 +120,26 @@ fn create_system(opts: &Opts) -> System {
                     if rng.gen::<f32>() < 0.05 {
                         system.set((x, y), (1.0, 1.0));
                     }
+                }
+            }
+        }
+        Some(Mode::Image { input }) => {
+            let im = image::open(input)
+                .unwrap()
+                .resize_exact(
+                    opts.width.into(),
+                    opts.height.into(),
+                    image::imageops::FilterType::Gaussian,
+                )
+                .into_luma();
+
+            for (x, y, p) in im.enumerate_pixels() {
+                let g = p.0[0];
+                if g < 127 {
+                    system.set(
+                        (usize::try_from(x).unwrap(), usize::try_from(y).unwrap()),
+                        (1.0, 1.0),
+                    );
                 }
             }
         }
