@@ -148,8 +148,8 @@ impl System {
 
 fn main() {
     let (width, height) = (512_u16, 512_u16);
-    let iterations = 3600;
-    let framerate = 120;
+    let iterations = 12000;
+    let speed = 20;
     let img_dir = Path::new("img");
     let video = true;
     let random_starting_state = false;
@@ -222,8 +222,11 @@ fn main() {
 
         system.evolve(1.0);
 
-        if video {
-            render(&system, img_dir.join(&format!("rd-{}.png", i)).as_os_str());
+        if video && i % speed == 0 {
+            render(
+                &system,
+                img_dir.join(&format!("rd-{}.png", i / speed)).as_os_str(),
+            );
         }
     }
 
@@ -233,7 +236,7 @@ fn main() {
         Command::new("ffmpeg")
             .args(&[
                 "-framerate",
-                &framerate.to_string(),
+                "60",
                 "-i",
                 img_dir.join("rd-%00d.png").to_str().unwrap(),
                 "-pix_fmt",
