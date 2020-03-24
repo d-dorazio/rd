@@ -2,7 +2,7 @@ use std::convert::TryFrom;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use rand::prelude::*;
@@ -10,34 +10,54 @@ use structopt::StructOpt;
 
 use rd::System;
 
+/// Program to generate images and even videos showing
+/// what Reaction Diffusion is all about.
 #[derive(Debug, StructOpt)]
 struct Opts {
+    /// Width of the final image/video.
     #[structopt(short, long, default_value = "512")]
     width: u16,
 
+    /// Height of the final image/video.
     #[structopt(short, long, default_value = "512")]
     height: u16,
 
+    /// How many iterations of the simulation to run.
+    ///
+    /// A big number is suggested when the initial seed is small enough.
     #[structopt(short, long, default_value = "300")]
     iterations: usize,
 
+    /// How much to speedup the image saving and the video.
     #[structopt(short, long, default_value = "1")]
     speed: usize,
 
+    /// Whether to disable creating the video using ffmpeg or not.
+    ///
+    /// It's turned off by default if ffmpeg is not found.
     #[structopt(long)]
     without_video: bool,
 
+    /// Where to store the temporary frames used to create the video.
     #[structopt(long, parse(from_os_str), default_value = "img")]
     img_dir: PathBuf,
 
+    /// The seed to use to start the generation.
     #[structopt(subcommand)]
-    mode: Option<Mode>,
+    seed: Option<Seed>,
 }
 
 #[derive(Debug, StructOpt)]
-enum Mode {
+enum Seed {
+    /// The process is seeded with a centered rectangle.
+    /// Used mostly as an example.
     Rect,
+
+    /// The process is seeded with a random grid of values.
     Random,
+
+    /// The process is seeded with the given image that is automatically
+    /// converted to grayscale.
     Image {
         #[structopt(parse(from_os_str))]
         input: PathBuf,
@@ -98,8 +118,8 @@ fn create_system(opts: &Opts) -> System {
     let width = system.width();
     let height = system.height();
 
-    match &opts.mode {
-        None | Some(Mode::Rect) => {
+    match &opts.seed {
+        None | Some(Seed::Rect) => {
             let l = width.min(height) / 4;
             let ty = height / 2 - l / 2;
             let sx = width / 2 - l / 2;
@@ -113,7 +133,7 @@ fn create_system(opts: &Opts) -> System {
                 system.set((rx, ty + i), (1.0, 1.0));
             }
         }
-        Some(Mode::Random) => {
+        Some(Seed::Random) => {
             let mut rng = thread_rng();
             for x in 0..width {
                 for y in 0..height {
@@ -123,7 +143,7 @@ fn create_system(opts: &Opts) -> System {
                 }
             }
         }
-        Some(Mode::Image { input }) => {
+        Some(Seed::Image { input }) => {
             let im = image::open(input)
                 .unwrap()
                 .resize_exact(
@@ -165,9 +185,11 @@ fn setup_img_dir(opts: &Opts) {
 
 impl Renderer {
     fn new(opts: &Opts) -> Self {
+        let with_video = !opts.without_video && Self::can_build_video();
+
         Self {
             img_dir: opts.img_dir.clone(),
-            with_video: !opts.without_video,
+            with_video,
             speed: opts.speed,
 
             tmp_img: image::GrayImage::new(opts.width.into(), opts.height.into()),
@@ -205,6 +227,20 @@ impl Renderer {
         }
 
         self.tmp_img.save(path).unwrap();
+    }
+
+    fn can_build_video() -> bool {
+        match Command::new("ffmpeg")
+            .args(&["-version"])
+            .stdout(Stdio::null())
+            .status()
+        {
+            Ok(e) if e.success() => true,
+            Err(_) | Ok(_) => {
+                eprintln!("disabling video output as ffmpeg was not found");
+                false
+            }
+        }
     }
 
     fn build_video(&self) {
