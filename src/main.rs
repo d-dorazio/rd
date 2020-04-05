@@ -28,6 +28,14 @@ struct Opts {
     #[structopt(short, long, default_value = "300")]
     iterations: usize,
 
+    /// The rate chemical A is poured into the system.
+    #[structopt(short, long, default_value = "0.055")]
+    feed_rate: f32,
+
+    /// The rate chemical B is killed from the system.
+    #[structopt(short, long, default_value = "0.062")]
+    kill_rate: f32,
+
     /// How much to speedup the image saving and the video.
     #[structopt(short, long, default_value = "1")]
     speed: usize,
@@ -114,6 +122,8 @@ generation took {} min {} secs
 
 fn create_system(opts: &Opts) -> System {
     let mut system = System::new(opts.width.into(), opts.height.into());
+    system.feed_rate = opts.feed_rate;
+    system.kill_rate = opts.kill_rate;
 
     let width = system.width();
     let height = system.height();
